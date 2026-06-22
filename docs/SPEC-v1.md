@@ -583,7 +583,7 @@ Voice Engine Worker (LiveKit Agent)
      │     • TurnDetector v1 (LiveKit Cloud, free)
      │     • STT: Deepgram Nova-3
      │     • LLM: OpenAI GPT-4o
-     │     • TTS: Cartesia Sonic-3.5 (v1 choice — see TTS comparison below)
+     │     • TTS: Configurable — Cartesia (default) or ElevenLabs (see TTS config below)
      │     • System prompt from script_template
      │
      ▼  (conversation happens)
@@ -654,40 +654,82 @@ if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 ```
 
-### TTS provider selection: Cartesia (v1)
+### TTS provider: configurable (Cartesia default, ElevenLabs optional)
 
-Researched and decided June 2026. Cartesia Sonic-3.5 is the v1 TTS provider.
+The TTS provider is configured per campaign/client via a `tts_provider` field on `script_templates` or `campaigns`. This lets the partner (or their clients) choose the price-quality tradeoff they want.
+
+```python
+from livekit.plugins import cartesia, elevenlabs
+
+def get_tts(provider: str, voice_name: str):
+    """Factory: returns a LiveKit TTS plugin based on the configured provider."""
+    if provider == "elevenlabs":
+        return elevenlabs.TTS(
+            model="flash_v2_5",
+            voice=voice_name,
+        )
+    # Default: Cartesia Sonic-3.5
+    return cartesia.TTS(
+        model="sonic-3.5",
+        voice=voice_name,
+    )
+```
+
+**Data model addition:** Add `tts_provider` column to `script_templates` table.
+
+| Column | Type | Default | Notes |
+|--------|------|---------|-------|
+| `tts_provider` | text | `"cartesia"` | `"cartesia"` or `"elevenlabs"` |
+| `tts_voice` | text | `"friendly-contractor"` | Provider-specific voice name |
+
+**Pricing comparison (for reference):**
 
 | Metric | Cartesia Sonic-3.5 | ElevenLabs Flash v2.5 |
 |--------|-------------------|----------------------|
 | **TTFB (latency)** | ~40ms (Turbo variant) | ~75ms |
 | **Cost per minute** | ~$0.02/min (Startup tier: $37/mo, 1,667 min) | ~$0.17/min (Pro tier: $99/mo, 600 min) |
-| **Cost ratio** | 1x | **8x more expensive** |
+| **Cost ratio** | 1x | **~8x more expensive** |
 | **Voice quality** | Natural, conversational | Ultra-realistic, best cloning |
-| **Concurrency (Startup)** | 5 concurrent requests | 5 (Pro tier) |
-| **Enterprise compliance** | DPAs and BAAs available | DPAs, BAAs (HIPAA) available |
 
-**Why Cartesia for v1:**
-- Cold calling is utility TTS, not premium voice content — the voice needs to be natural enough to hold a conversation, not indistinguishable from human
-- At 500 calls/month × 3 min avg = 1,500 TTS minutes: Cartesia costs ~$37/mo vs ElevenLabs ~$249/mo
-- Lower latency (40ms vs 75ms) means more natural turn-taking with Turn Detector v1
-- Cartesia also offers STT (Ink-2) and Voice Agents (Line) if we want to consolidate providers later
+**Configurable via env vars:**
 
-**When to switch to ElevenLabs:** If the partner's clients specifically request ultra-realistic voices or voice cloning (e.g., cloning the contractor's own voice for their speed-to-lead calls). That's a v2 upsell feature.
+```
+# TTS selection (per-agent, overridable per campaign)
+DEFAULT_TTS_PROVIDER=cartesia         # or elevenlabs
+CARTESIA_API_KEY=...
+ELEVENLABS_API_KEY=...
+```
+
+The LiveKit Agent session init picks up the config from the job metadata:
+
+```python
+async def entrypoint(ctx: JobContext):
+    contact = ctx.job.metadata
+    tts_provider = contact.get("tts_provider", "cartesia")
+    tts_voice = contact.get("tts_voice", "friendly-contractor")
+
+    session = AgentSession(
+        ...
+        tts=get_tts(tts_provider, tts_voice),
+    )
+```
+
+**v1 strategy:** Default to Cartesia (cost-effective, low latency). If a client wants ultra-realistic voices or voice cloning (e.g., cloning the contractor's own voice for speed-to-lead calls), switch to ElevenLabs at a premium price. The spend tracker handles this transparently — the user sees the actual cost per call regardless of which TTS provider is used.
 
 ### Voicemail detection (software-based)
 
-**Problem:** Twilio's Answering Machine Detection (AMD) does NOT work with SIP trunking — it only works with Programmable Voice calls. Since LiveKit uses SIP trunking via Twilio, AMD is unavailable.
+**Problem:** Twilio's Answering Machine Detection (AMD) does NOT work with SIP trunking — it only works with Programmable Voice calls. Since LiveKit uses SIP trunking via Twilio, AMD is unavailable by default.
 
-**v1 solution:** STT-based voicemail detection. After the call connects, the agent listens to the first utterance. If the transcript matches voicemail patterns, the agent leaves a brief message and hangs up.
+**v1 solution:** STT-based voicemail detection using conservative patterns — only clear voicemail indicators, nothing that sounds like a normal human greeting.
 
 ```python
 import re
 
+# Conservative — only unmistakable voicemail language.
+# NOT included: "you've reached" (false positive: "You've reached Joe's Plumbing").
 VOICEMAIL_PATTERNS = [
     r"leave a message",
     r"after (the|this) (beep|tone)",
-    r"you'?ve reached",
     r"(please )?leave your name",
     r"mailbox is full",
     r"not available",
@@ -695,10 +737,11 @@ VOICEMAIL_PATTERNS = [
     r"recorded after",
     r"at the (sound|tone) of",
     r"call back later",
+    r"this is (.* )?voicemail",
+    r"please record",
 ]
 
 def is_voicemail(first_utterance: str) -> bool:
-    """Check if the first utterance matches voicemail patterns."""
     text = first_utterance.lower().strip()
     if len(text) < 3:
         return False
@@ -717,21 +760,86 @@ def is_voicemail(first_utterance: str) -> bool:
 ```python
 class ContractorAgent(Agent):
     async def on_user_turn_completed(self, turn_text: str):
-        # Check first utterance for voicemail
         if self._is_first_turn and is_voicemail(turn_text):
             await self.session.generate_reply(
                 instructions="This is a voicemail. Leave a brief message: "
                 "'Hi, this is [Agent] from [Agency]. We help contractors "
                 "get more booked jobs. Give us a call back at [number]. Thanks!'"
             )
-            await asyncio.sleep(8)  # let the message play
+            await asyncio.sleep(8)
             await self.session.end_call()
             return
         # Normal conversation flow
         ...
 ```
 
-**Limitation:** This is heuristic, not perfect. A human saying "you've reached John" could trigger a false positive. Mitigate by requiring multiple pattern matches or checking for a beep/silence after the greeting. Refine during pilot.
+**Known limitation:** Misses greetings like "You've reached Joe's Plumbing" because that pattern was excluded (too many false positives). The fallback path below addresses this.
+
+### Voicemail fallback: Twilio-first AMD
+
+For better accuracy (~95%), dial via Twilio Programmable Voice first, detect voicemail natively, then bridge to LiveKit only if human answers.
+
+**Flow:**
+
+```
+Twilio Programmable Voice dials number
+  with MachineDetection=DetectMessageEnd
+        │
+   ┌────▼────────┐
+   │  AMD result  │  (~2-3 seconds)
+   └────┬────────┘
+        │
+  ┌─────▼─────┐          ┌───────────────┐
+  │  human    │          │ unknown /     │
+  │           │          │ voicemail /   │
+  └─────┬─────┘          │ machine       │
+        │                └───────┬───────┘
+        ▼                        ▼
+  Transfer to LiveKit       Play prerecorded msg
+  via SIP trunk             via Twilio → hang up
+  → agent connects
+```
+
+```python
+# Step 1: Twilio outbound with AMD
+client.calls.create(
+    to=phone_number,
+    from_=twilio_number,
+    url="https://hub.crmandmore.ca/twilio/amd-callback",
+    machine_detection="DetectMessageEnd",
+)
+
+# Step 2: AMD callback
+@app.post("/twilio/amd-callback")
+async def amd_callback(request: Request):
+    form = await request.form()
+    answered_by = form.get("AnsweredBy", "")
+
+    if answered_by == "human":
+        return TwiML(
+            dial(
+                sip("sip:room_abc123@crm-livekit-trunk.twilio.com",
+                    username=SIP_USER, password=SIP_PASS)
+            )
+        )
+    else:
+        return TwiML(
+            say("Hi, quick message from [Agency]... Call us back."),
+            hangup()
+        )
+```
+
+**Tradeoffs vs STT:**
+
+| Aspect | STT (v1 default) | Twilio-first AMD |
+|--------|-----------------|------------------|
+| Accuracy | ~80% (conservative patterns) | ~95% (Twilio trained model) |
+| Extra latency | 0s | +2-3s before agent connects |
+| Extra cost | $0/call | ~$0.005-0.01/call |
+| Complexity | Simple agent code | TwiML routing + SIP bridge |
+| Voicemail msg | Agent says it (personalized) | Prerecorded Twilio audio |
+
+Both approaches coexist via a `voicemail_detection` setting on campaigns (`"stt"` or `"twilio_amd"`). v1 starts with STT, switches to Twilio-first if accuracy isn't good enough during pilot.
 
 ### Max call duration cap
 
@@ -1341,17 +1449,45 @@ async def verify_consent(contact: Contact) -> tuple[bool, str]:
 
 **v1 policy:** Mode B only calls contacts with `consent_status = express` (form fill) or `existing_relationship`. No cold consumer calling in v1.
 
-### National DNCL checking (consumer mode)
+### National DNCL registration: step-by-step process
 
-The Canadian National DNCL has a **public API** for checking numbers programmatically — no need to download and maintain the full list.
+**What is this?** The National Do Not Call List (DNCL) is a Canadian government list of consumers who don't want telemarketing calls. If you dial consumer numbers (Mode B — speed-to-lead for contractor clients), you legally must be registered. Mode A (B2B prospecting) is exempt — business numbers aren't on the DNCL.
 
-**Setup:**
-1. Partner registers as telemarketer at [lnnte-dncl.gc.ca](https://lnnte-dncl.gc.ca/en/Organization/Register-your-organization) (select "Other" as telemarketer identity)
-2. Must have a Dun & Bradstreet number (register if not)
-3. Email support@lnnte-dncl.gc.ca with RAN, account manager name + email, requesting API access
-4. Receive unique API access key
+**Who needs to register?** The partner (your friend's GHL agency), not you. They're the telemarketer making the calls on behalf of their contractor clients. Each of their clients may also need their own subscription (ask the DNCL operator during registration).
 
-**DNCL check before dialing (Mode B):**
+**What it costs:** Approximately $100-300/year based on list size. Not expensive, just paperwork.
+
+**Step-by-step registration:**
+
+```
+Step 1: Get a Dun & Bradstreet (D&B) number
+  └─ Go to https://www.dnb.com/
+  └─ Click "Get a D-U-N-S Number"
+  └─ Free for Canadian businesses
+  └─ Takes ~30 minutes online
+  └─ You need: business name, address, phone, legal structure
+
+Step 2: Register as a telemarketer at lnnte-dncl.gc.ca
+  └─ Go to https://lnnte-dncl.gc.ca/en/Organization/Register-your-organization
+  └─ Select "Other" for Telemarketer Identity
+  └─ Enter your D&B number
+  └─ They'll issue you a RAN (Registration Account Number)
+
+Step 3: Email support@lnnte-dncl.gc.ca
+  └─ Subject: "API Access Request — [RAN Number]"
+  └─ Include: RAN, Account Manager Name, Account Manager Email
+  └─ Wait ~1-2 weeks for response
+
+Step 4: You get an API key
+  └─ This key goes in our .env as DNCL_API_KEY
+  └─ Our system uses it to check numbers before dialing
+```
+
+**Important:** The partner needs to do this BEFORE we dial any consumer numbers. Mode A (B2B contractor prospecting) doesn't need it. But Mode B (homeowner speed-to-lead) requires it. If the pilot is only prospecting contractors (Mode A to start), you can delay this.
+
+### National DNCL checking (runtime)
+
+Once registered and API key is obtained, check consumer numbers before dialing:
 
 ```python
 async def check_dncl(phone: str, dncl_api_key: str) -> bool:
@@ -1364,11 +1500,9 @@ async def check_dncl(phone: str, dncl_api_key: str) -> bool:
         return data.get("isRegistered", False)
 ```
 
-**Note:** For v1 Mode B (form-fill consent), DNCL scrub is technically optional — express consent overrides DNCL registration. However, checking DNCL is best practice and provides a due-diligence defense. The compliance module checks DNCL and logs the result regardless, but only blocks the call if `consent_status` is not `express`.
+**Note:** Express consent (form fill) overrides DNCL registration legally. But scrubbing against the DNCL before every call is best practice and provides a due-diligence defense if ever questioned by the CRTC.
 
-**Alternative:** RealValidito API (RapidAPI) for phone validation + line type detection (landline/mobile/VoIP) + US DNC check. Useful for enriching prospect data and filtering invalid numbers before calling. 100 free credits, then pay-as-you-go.
-
-Every compliance decision is logged to `compliance_log`:
+**Alternative (phone enrichment):** RealValidito API via RapidAPI for phone validation + line type detection (landline/mobile/VoIP). Useful for filtering invalid numbers before calling. 100 free credits included.
 
 ```python
 async def log_compliance(contact_id, call_id, action, result):
@@ -1786,11 +1920,11 @@ Items resolved during spec review (June 2026):
 
 Items still open (require user action, not research):
 
-- [ ] **Lawyer consultation:** 1-2 hour consult with Canadian telecom lawyer. Bring CRTC 2026-132 document. Confirm precautionary AI disclosure approach is sufficient. (~$300-500 CAD)
-- [ ] **Partner agreement:** Draft and sign before first paying client. Covers revenue share (25-30%), vicarious liability, data ownership.
-- [ ] **Partner DNCL registration:** Partner registers as telemarketer at lnnte-dncl.gc.ca, obtains RAN + API access key. Requires Dun & Bradstreet number.
-- [ ] **CRTC 2026-132 monitoring:** Intervention deadline July 27, 2026. Ruling expected fall 2026. Adjust compliance if ADAD definition expands to cover AI.
-- [ ] **Voicemail pattern refinement:** Test STT-based voicemail detection during pilot, refine regex patterns based on false positives/negatives.
+- [ ] **ADAD re-check (June 27, 2026):** Revisit CRTC 2026-132 status 5 days from now. Check if any industry interventions have been filed. Evaluate whether to submit own intervention.
+- [ ] **AI lawyer review:** Use an AI legal analysis tool to analyze CRTC 2026-132 and confirm the precautionary AI disclosure approach. Human lawyer still preferred before paying clients, but AI review is a good first pass.
+- [ ] **Partner agreement:** Draft before first paying client (revenue share, vicarious liability), but friends-first — no rush, handle when revenue is imminent.
+- [ ] **Partner DNCL registration:** Partner registers as telemarketer at lnnte-dncl.gc.ca, obtains RAN + API access key. Requires Dun & Bradstreet number. See explanation in follow-up.
+- [ ] **Voicemail refinement during pilot:** Start with STT-based (conservative patterns, no "you've reached"). If accuracy isn't good enough, switch to Twilio-first AMD fallback. Both approaches coexist via campaign-level setting.
 
 ---
 
