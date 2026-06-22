@@ -115,6 +115,27 @@ The full CRMAndMore vision (Frappe/ERPNext per-client sites, package tiers, dent
 | **Call Logs** | Recordings, transcripts, outcomes, duration | Storage (DO Spaces) + Postgres |
 | **Dashboard** | Agency + per-client views, campaign management, spend reports | FastAPI templates (Jinja) or minimal SPA |
 
+### Data residency (PIPEDA compliance)
+
+Canada's PIPEDA doesn't require data to stay in Canada, but requires adequate protection for data that crosses borders. Here's where each data flow goes:
+
+| Data | Provider | Processing location | PIPEDA note |
+|------|----------|-------------------|-------------|
+| Call audio (real-time) | Twilio + LiveKit Cloud | Twilio: Canada/US; LiveKit: us-east (Virginia) | Voice data transits through US servers |
+| STT (speech-to-text) | Deepgram | US (api.deepgram.com) or EU (api.eu.deepgram.com) | Use EU endpoint for marginally better privacy posture |
+| LLM (conversation) | OpenAI | US | Business data (contractor names, call content) transits to US |
+| TTS (text-to-speech) | Cartesia | US | Text transits to US |
+| Recordings + transcripts | DO Spaces (Toronto) | Canada | Stored in Canada |
+| Contact data + PII | PostgreSQL (DO Toronto) | Canada | Stored in Canada |
+| GHL sync | GoHighLevel | US (GHL is US-hosted) | Contact data already in GHL (US) |
+
+**v1 approach:** All data at rest is in Canada (Postgres + DO Spaces Toronto). Real-time processing transits through US (LiveKit, Deepgram, OpenAI, Cartesia). This is PIPEDA-compliant as long as:
+1. Privacy policy discloses which providers process data and where
+2. Providers have adequate security (all are SOC2 compliant)
+3. No PHI/health data in v1 (dental/PHIPA is v3+)
+
+**v2 upgrade path:** Self-host LiveKit on DO Toronto to keep real-time voice data in Canada. Switch Deepgram to EU endpoint. This gets most data flows within Canada/EU, with only OpenAI remaining in US (no Canadian LLM provider at scale yet).
+
 ### Tech stack decisions
 
 | Layer | Choice | Rationale |
@@ -123,10 +144,11 @@ The full CRMAndMore vision (Frappe/ERPNext per-client sites, package tiers, dent
 | Hub framework | FastAPI | Async, typed, fast, great for API + lightweight dashboard |
 | Voice agent | LiveKit Agents SDK (Python) 1.6.1+ | Native Turn Detector v1 support, telephony via SIP |
 | Turn detection | LiveKit Turn Detector v1 (Cloud) | Free on LiveKit Cloud, state-of-the-art, default in SDK |
-| STT | Deepgram Nova-3 | Fast, multilingual, Canadian data processing available |
-| LLM | OpenAI GPT-4o (via API) | Reliable, well-supported in LiveKit; document in privacy policy |
-| TTS | Cartesia or ElevenLabs | Natural voice; evaluate both in pilot |
+| STT | Deepgram Nova-3 | Fast, multilingual. **No Canada endpoint** — EU endpoint available (api.eu.deepgram.com), US default. SOC2/HIPAA/GDPR compliant. For v1 (no PHI), US endpoint acceptable — document in privacy policy |
+| LLM | OpenAI GPT-4o (via API) | Reliable, well-supported in LiveKit; data transits to US — document in privacy policy |
+| TTS | Cartesia Sonic-3.5 | ~$0.02/min (8x cheaper than ElevenLabs), 40ms TTFB. See TTS comparison in §6 |
 | Telephony | Twilio Canada (SIP trunk → LiveKit) | Canadian DIDs, local presence, SIP trunking docs exist |
+| Voice runtime | LiveKit Cloud (us-east region) | **No Canada region** — us-east (Virginia) is closest to Toronto. For v1, acceptable. v2: self-host on DO Toronto for full data residency |
 | Database | PostgreSQL (DigitalOcean Managed) | Relational, reliable, Toronto region |
 | Object storage | DigitalOcean Spaces (Toronto) | Call recordings, transcripts |
 | Hosting | DigitalOcean Toronto (TOR1) | Cheapest Canada residency, simple, student-budget friendly |
@@ -522,9 +544,11 @@ For richer data at comparable cost, Apify offers Google Maps scrapers that extra
 | API key needed | Google Maps Platform | Apify account |
 | Pagination | Manual (nextPageToken) | Built-in (maxResults param) |
 
-**Recommendation:** Start with Google Places API (ToS-safe for a commercial product). If the partner needs `claimedBusiness` filtering or email enrichment, switch to Apify. The `claimedBusiness: false` filter is particularly valuable for agency prospecting — unclaimed Google Business Profiles are easy pitches ("I'll claim and optimize your profile").
+**Decision (June 2026): Use Google Places API for v1.** Google's Terms of Service explicitly prohibit scraping. For a commercial product that the partner is selling to clients, ToS compliance is non-negotiable — a client could sue if the tool they're paying for uses scraped data. The Places API is ToS-safe and the optimized Text Search approach costs about the same (~$2/1,000 vs ~$2.50/1,000).
 
-**Apify integration (if used):**
+The `claimedBusiness` flag from Apify would be nice for targeting unclaimed Google Business Profiles, but we can approximate this by checking if the business has a website (no website = likely unclaimed/less sophisticated = good prospect). The Places API already returns `websiteUri`.
+
+**Apify integration (available as fallback if needed):**
 ```python
 async def search_contractors_apify(trade: str, city: str, api_token: str):
     url = "https://api.apify.com/v2/acts/solidcode~google-maps-scraper-2-5-per-1-000-results/runs"
@@ -559,7 +583,7 @@ Voice Engine Worker (LiveKit Agent)
      │     • TurnDetector v1 (LiveKit Cloud, free)
      │     • STT: Deepgram Nova-3
      │     • LLM: OpenAI GPT-4o
-     │     • TTS: Cartesia / ElevenLabs
+     │     • TTS: Cartesia Sonic-3.5 (v1 choice — see TTS comparison below)
      │     • System prompt from script_template
      │
      ▼  (conversation happens)
@@ -629,6 +653,27 @@ async def entrypoint(ctx: JobContext):
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 ```
+
+### TTS provider selection: Cartesia (v1)
+
+Researched and decided June 2026. Cartesia Sonic-3.5 is the v1 TTS provider.
+
+| Metric | Cartesia Sonic-3.5 | ElevenLabs Flash v2.5 |
+|--------|-------------------|----------------------|
+| **TTFB (latency)** | ~40ms (Turbo variant) | ~75ms |
+| **Cost per minute** | ~$0.02/min (Startup tier: $37/mo, 1,667 min) | ~$0.17/min (Pro tier: $99/mo, 600 min) |
+| **Cost ratio** | 1x | **8x more expensive** |
+| **Voice quality** | Natural, conversational | Ultra-realistic, best cloning |
+| **Concurrency (Startup)** | 5 concurrent requests | 5 (Pro tier) |
+| **Enterprise compliance** | DPAs and BAAs available | DPAs, BAAs (HIPAA) available |
+
+**Why Cartesia for v1:**
+- Cold calling is utility TTS, not premium voice content — the voice needs to be natural enough to hold a conversation, not indistinguishable from human
+- At 500 calls/month × 3 min avg = 1,500 TTS minutes: Cartesia costs ~$37/mo vs ElevenLabs ~$249/mo
+- Lower latency (40ms vs 75ms) means more natural turn-taking with Turn Detector v1
+- Cartesia also offers STT (Ink-2) and Voice Agents (Line) if we want to consolidate providers later
+
+**When to switch to ElevenLabs:** If the partner's clients specifically request ultra-realistic voices or voice cloning (e.g., cloning the contractor's own voice for their speed-to-lead calls). That's a v2 upsell feature.
 
 ### Voicemail detection (software-based)
 
@@ -1202,7 +1247,54 @@ Canada-only telemarketing compliance under CRTC Unsolicited Telecommunications R
 | **Caller identification** | Must identify yourself + purpose at call start | Enforced in script system prompts |
 | **Internal DNCL** | Must maintain own do-not-call list; honor within 14 days | `consent_status = none` + internal blocklist table |
 | **Vicarious liability** | Client of telemarketer is liable for violations | Partner (agency) is the client — document in partner agreement |
-| **ADAD rules** | Automatic Dialing-Announcing Devices (one-way prerecorded) heavily restricted | Conversational AI is arguably NOT an ADAD (interactive, not one-way) — flag for legal review |
+| **ADAD rules** | Automatic Dialing-Announcing Devices (one-way prerecorded) heavily restricted | **Actively under CRTC review** — see ADAD section below. v1 approach: proactive AI disclosure + follow ADAD consent rules as precaution |
+
+### ADAD classification — CRTC Notice of Consultation 2026-132
+
+**This is the most important compliance question for the product.** Researched June 2026.
+
+**Current ADAD definition (UTRs Part I):**
+> "ADAD" means any automatic equipment incorporating the capability of storing or producing telecommunications numbers used alone or in conjunction with other equipment to convey a **pre-recorded or synthesized voice message** to a telecommunications number.
+
+**The problem:** The definition says "pre-recorded or synthesized voice message." Conversational AI dynamically generates responses in real-time — it's not delivering a pre-recorded message. However, "synthesized voice message" could be interpreted to cover AI-generated speech. The definition is ambiguous for conversational AI.
+
+**CRTC is actively reviewing this.** On June 11, 2026, the CRTC published [Notice of Consultation CRTC 2026-132](https://crtc.gc.ca/eng/archive/2026/2026-132.htm) — "Review of the Unsolicited Telecommunications Rules." Key questions:
+
+- **Q2:** "Is the [ADAD] definition sufficient to capture software, applications, or technologies that use synthesized voices, recordings, artificial intelligence, or other methods of non-human generated voice messages?"
+- **Q10:** "Should the identification requirements be expanded to require telemarketers to tell consumers that the call is using this sort of technology (i.e., it is not a live person making the call and speaking with the consumer at the start of the call)?"
+- **Q11:** Should UTRs apply to personal-use AI calls (e.g., calling a restaurant to make a reservation)?
+
+**Deadlines:**
+- Intervention submissions: **July 27, 2026**
+- Reply submissions: **August 11, 2026**
+- Ruling: Unknown (likely fall 2026)
+
+**v1 compliance strategy (precautionary):**
+
+Until the CRTC rules, we operate as if conversational AI **may** be classified as an ADAD. This means:
+
+1. **AI disclosure at call start** — The agent identifies itself as an AI assistant in the opening greeting. This proactively complies with potential Q10 requirements and builds trust.
+
+```python
+def _build_greeting(self) -> str:
+    biz = self.context.get("business_name", "there")
+    city = self.context.get("city", "your area")
+    return (
+        f"Hi, I'm calling from [Agency Name] using an AI assistant. "
+        f"I'm reaching out to {biz} in {city} about helping "
+        f"contractors get more booked jobs. Do you have 30 seconds?"
+    )
+```
+
+2. **Follow ADAD consent rules for Mode B (B2C)** — Only call consumers with express consent (form fill) or existing business relationship. This is already the v1 policy.
+
+3. **Follow ADAD identification rules** — Agent states: (a) who it's calling on behalf of, (b) purpose of the call, (c) callback number or email. This matches Part IV, section 4(d) requirements.
+
+4. **Mode A (B2B) is lower risk** — B2B calls are exempt from DNCL Rules. ADAD rules technically still apply, but the CRTC's Q11 suggests they're considering exempting legitimate business-purpose AI calls. B2B cold calling with AI disclosure is the safest entry point.
+
+5. **Monitor the consultation** — Submit an intervention if beneficial (the user is a Canadian student building a Canadian product — stakeholder perspective is relevant). Track the ruling outcome.
+
+**Still needed:** A brief consultation with a Canadian telecom lawyer to confirm this precautionary approach is sufficient. The CRTC consultation document itself is the best reference to bring — it shows the regulator hasn't decided yet, which means the legal risk is ambiguous but manageable with proactive disclosure.
 
 ### Calling hours enforcement
 
@@ -1289,12 +1381,14 @@ async def log_compliance(contact_id, call_id, action, result):
 
 ### Legal review items (before pilot)
 
-- [ ] Confirm conversational AI is not classified as ADAD under CRTC
-- [ ] Partner registers with National DNCL (obtain RAN)
+- [x] **ADAD classification:** CRTC is actively reviewing (Notice 2026-132, June 2026). v1 uses precautionary approach: AI disclosure + ADAD consent rules. Still need lawyer to confirm approach is sufficient.
+- [ ] **Consult telecom lawyer:** Bring CRTC 2026-132 document. Confirm precautionary AI disclosure approach. ~1-2 hour consultation.
+- [ ] Partner registers with National DNCL (obtain RAN + API access key)
 - [ ] Partner agreement documents vicarious liability
-- [ ] Privacy policy discloses: AI calling, recording, OpenAI data transit to US
-- [ ] Call recording consent (one-party consent in Canada — confirm Ontario)
-- [ ] Retention policy for recordings + transcripts
+- [ ] Privacy policy discloses: AI calling, AI disclosure at call start, recording, OpenAI data transit to US, Deepgram data transit to US
+- [ ] Call recording consent (one-party consent in Canada — confirmed for Ontario under PIPEDA)
+- [ ] Retention policy for recordings + transcripts (90 days default)
+- [ ] Monitor CRTC 2026-132 ruling (expected fall 2026) — adjust compliance if definition expands
 
 ---
 
@@ -1676,28 +1770,27 @@ crmandmore/
 
 Items resolved during spec review (June 2026):
 
-- [x] **TTS provider:** Cartesia vs ElevenLabs — pilot both, pick on voice quality + cost *(still open — pilot during weeks 3-4)*
-- [x] **ADAD classification:** Flagged for legal review — conversational AI is interactive (not one-way prerecorded), likely NOT an ADAD, but unconfirmed *(legal review still needed)*
-- [x] **Call recording consent:** Canada is one-party consent — confirmed, but document in privacy policy
-- [x] **Deepgram data region:** Flagged — confirm Canadian/region-pinned processing available
-- [x] **LiveKit Cloud region:** Flagged — confirm Canada region availability for data residency
-- [x] **Partner agreement:** Draft 1-page design partner agreement (revenue share %, liability)
-- [x] **GHL app type:** Private Integration for v1 (fast), Marketplace app for v2
-- [x] **Dashboard approach:** Server-rendered (Jinja) for v1 — simplest, upgrade to SPA if needed
-- [x] **National DNCL:** Use official DNCL API (lnnte-dncl.gc.ca) for real-time checks — no full list download needed
-- [x] **OpenAI data transit:** Document in privacy policy (no PHI in v1, but business data crosses to US)
-- [x] **Voicemail detection:** Twilio AMD doesn't work with SIP — using STT-based pattern detection instead
-- [x] **Redis:** Dropped for v1 — APScheduler runs in-process, Postgres-backed queue
+- [x] **TTS provider:** **Cartesia Sonic-3.5** — ~$0.02/min (8x cheaper than ElevenLabs at $0.17/min), 40ms TTFB. Utility TTS doesn't need ElevenLabs' premium realism. See §6 TTS comparison.
+- [x] **ADAD classification:** **CRTC is actively reviewing** (Notice of Consultation 2026-132, published June 11, 2026). Current definition ambiguous for conversational AI. v1 uses precautionary approach: AI disclosure at call start + follow ADAD consent rules. See §8 ADAD section. Still need lawyer consultation.
+- [x] **Call recording consent:** Canada is one-party consent under PIPEDA — confirmed for Ontario. Document in privacy policy.
+- [x] **Deepgram data region:** **No Canada endpoint.** EU endpoint available (api.eu.deepgram.com). US default. SOC2/HIPAA/GDPR compliant. v1 uses US endpoint (no PHI), document in privacy policy. See §3 data residency table.
+- [x] **LiveKit Cloud region:** **No Canada region.** Three regions: us-east (Virginia), eu-central (Frankfurt), ap-south (Mumbai). v1 uses us-east (closest to Toronto). v2: self-host on DO Toronto for full data residency. See §3 data residency table.
+- [x] **Apify vs Places API:** **Google Places API for v1.** Google ToS prohibits scraping — ToS compliance is non-negotiable for a commercial product. Cost is comparable (~$2/1,000 vs ~$2.50/1,000). Can approximate `claimedBusiness` by checking `websiteUri` presence.
+- [x] **Voicemail detection:** Twilio AMD doesn't work with SIP — using STT-based pattern detection. Heuristic approach with regex patterns on first utterance. Refine during pilot.
+- [x] **Redis:** Dropped for v1 — APScheduler runs in-process, Postgres-backed queue.
+- [x] **GHL app type:** Private Integration for v1 (fast), Marketplace app for v2.
+- [x] **Dashboard approach:** Server-rendered (Jinja) for v1 — simplest, upgrade to SPA if needed.
+- [x] **National DNCL:** Use official DNCL API (lnnte-dncl.gc.ca) for real-time checks — no full list download needed.
+- [x] **OpenAI data transit:** Documented in privacy policy + data residency table (§3). Business data transits to US, no PHI in v1.
+- [x] **GHL custom field IDs:** Documented in §7 — must be pre-created in GHL Custom Fields settings, IDs fetched via `GET /custom-fields/` API, mapped in hub config per location.
 
-Items still open:
+Items still open (require user action, not research):
 
-- [ ] **TTS provider selection:** Pilot Cartesia vs ElevenLabs during weeks 3-4
-- [ ] **ADAD legal confirmation:** Get legal opinion on conversational AI classification under CRTC
-- [ ] **Deepgram/LiveKit Canada regions:** Confirm data residency options before pilot
-- [ ] **Partner agreement:** Draft and sign before first paying client
-- [ ] **Apify vs Places API:** Decide based on whether `claimedBusiness` flag justifies ToS risk
-- [ ] **Voicemail detection accuracy:** STT-based approach is heuristic — refine patterns during pilot
-- [ ] **GHL custom field IDs:** Must be pre-created in GHL and mapped in hub config per location
+- [ ] **Lawyer consultation:** 1-2 hour consult with Canadian telecom lawyer. Bring CRTC 2026-132 document. Confirm precautionary AI disclosure approach is sufficient. (~$300-500 CAD)
+- [ ] **Partner agreement:** Draft and sign before first paying client. Covers revenue share (25-30%), vicarious liability, data ownership.
+- [ ] **Partner DNCL registration:** Partner registers as telemarketer at lnnte-dncl.gc.ca, obtains RAN + API access key. Requires Dun & Bradstreet number.
+- [ ] **CRTC 2026-132 monitoring:** Intervention deadline July 27, 2026. Ruling expected fall 2026. Adjust compliance if ADAD definition expands to cover AI.
+- [ ] **Voicemail pattern refinement:** Test STT-based voicemail detection during pilot, refine regex patterns based on false positives/negatives.
 
 ---
 
@@ -1713,12 +1806,18 @@ Items still open:
 - **Apify Google Maps Scraper:** https://apify.com/solidcode/google-maps-scraper-2-5-per-1-000-results
 - **CRTC telemarketing rules:** https://crtc.gc.ca/eng/phone/telemarketing/biz.htm
 - **CRTC UT Rules:** https://crtc.gc.ca/eng/trules-reglest.htm
+- **CRTC Notice of Consultation 2026-132 (ADAD/AI review):** https://crtc.gc.ca/eng/archive/2026/2026-132.htm
 - **Canadian National DNCL API:** https://lnnte-dncl.gc.ca/en/Organization/DNCL_API
 - **RealValidito DNC lookup:** https://www.realvalidito.com/dnc-lookup/
 - **Twilio AMD (does NOT work with SIP):** https://www.twilio.com/docs/voice/answering-machine-detection-faq-best-practices
 - **LiveKit SIP voicemail detection issue:** https://github.com/livekit/sip/issues/403
 - **LiveKit + Twilio SIP:** https://docs.livekit.io/telephony/start/providers/twilio/
 - **LiveKit outbound calls:** https://docs.livekit.io/agents/quickstarts/outbound-calls/
+- **Cartesia pricing:** https://www.cartesia.ai/pricing
+- **ElevenLabs pricing:** https://elevenlabs.io/pricing
+- **Deepgram data privacy compliance:** https://developers.deepgram.com/trust-security/data-privacy-compliance
+- **LiveKit Cloud regions:** https://livekit.com/products/agent-cloud-deployment
+- **Apify Google Maps Scraper:** https://apify.com/solidcode/google-maps-scraper-2-5-per-1-000-results
 
 ---
 
